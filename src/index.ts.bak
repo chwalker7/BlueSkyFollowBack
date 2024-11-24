@@ -1,0 +1,225 @@
+import { Worker } from 'worker_threads'
+import * as path from 'path'
+import * as dotenv from 'dotenv'
+import { BskyAgent } from '@atproto/api'
+
+dotenv.config()
+
+const NUM_WORKERS = 3 // Number of follower workers to run
+const HEALTH_CHECK_THRESHOLD = 50 // Pause workers if remaining requests below this
+
+interface FollowTask {
+  did: string
+  handle: string
+}
+
+class WorkerPool {
+  private healthCheckWorker: Worker
+  private followerWorkers: Worker[] = []
+  private taskQueue: FollowTask[] = []
+  private workerStatus: boolean[] = []
+  private paused = false
+  private stats = {
+    totalProcessed: 0,
+    successfulFollows: 0,
+    rateLimitHits: 0
+  }
+
+  constructor() {
+    // Initialize health check worker
+    this.healthCheckWorker = new Worker(path.join(__dirname, 'healthCheck.worker.js'))
+    this.setupHealthCheck()
+
+    // Initialize follower workers
+    for (let i = 0; i < NUM_WORKERS; i++) {
+      const worker = new Worker(path.join(__dirname, 'follower.worker.js'))
+      this.followerWorkers.push(worker)
+      this.workerStatus.push(false) // Track if worker is ready for task
+      this.setupFollowerWorker(worker, i)
+    }
+  }
+
+  private setupHealthCheck() {
+    this.healthCheckWorker.on('message', (status) => {
+      if (!status.healthy || (status.remaining && status.remaining < HEALTH_CHECK_THRESHOLD)) {
+        if (!this.paused) {
+          console.log('\n⚠️ API health check failed, pausing workers')
+          this.pauseWorkers()
+        }
+      } else if (this.paused && status.remaining > HEALTH_CHECK_THRESHOLD) {
+        console.log('\n✅ API health restored, resuming workers')
+        this.resumeWorkers()
+      }
+
+      // Log current status
+      console.log('\nAPI Status:')
+      console.log(`Healthy: ${status.healthy}`)
+      console.log(`Remaining requests: ${status.remaining || 'unknown'}`)
+      console.log(`Workers paused: ${this.paused}`)
+      console.log(`Queue size: ${this.taskQueue.length}`)
+      console.log(`Progress: ${this.stats.successfulFollows}/${this.stats.totalProcessed} follows`)
+    })
+
+    // Send credentials to health check worker
+    this.healthCheckWorker.postMessage({
+      identifier: process.env.BLUESKY_USERNAME,
+      password: process.env.BLUESKY_PASSWORD
+    })
+  }
+
+  private setupFollowerWorker(worker: Worker, index: number) {
+    worker.on('message', (message) => {
+      switch (message.type) {
+        case 'ready':
+          this.workerStatus[index] = true
+          this.assignTaskIfAvailable(index)
+          break
+
+        case 'result':
+          this.stats.totalProcessed++
+          if (message.success) {
+            this.stats.successfulFollows++
+            console.log(`✅ Worker ${index + 1} followed ${message.handle}`)
+          } else {
+            if (message.isRateLimit) {
+              this.stats.rateLimitHits++
+              console.log(`⚠️ Worker ${index + 1} hit rate limit for ${message.handle}`)
+            } else {
+              console.log(`❌ Worker ${index + 1} failed to follow ${message.handle}: ${message.error}`)
+            }
+          }
+          this.workerStatus[index] = true
+          this.assignTaskIfAvailable(index)
+          break
+
+        case 'error':
+          console.error(`Worker ${index + 1} error:`, message.error)
+          break
+      }
+    })
+
+    // Send credentials to worker
+    worker.postMessage({
+      type: 'credentials',
+      identifier: process.env.BLUESKY_USERNAME,
+      password: process.env.BLUESKY_PASSWORD
+    })
+  }
+
+  private assignTaskIfAvailable(workerIndex: number) {
+    if (this.paused || this.taskQueue.length === 0 || !this.workerStatus[workerIndex]) {
+      return
+    }
+
+    const task = this.taskQueue.shift()
+    if (task) {
+      this.workerStatus[workerIndex] = false
+      this.followerWorkers[workerIndex].postMessage({ type: 'task', task })
+    }
+  }
+
+  private pauseWorkers() {
+    this.paused = true
+    this.followerWorkers.forEach(worker => {
+      worker.postMessage({ type: 'pause' })
+    })
+  }
+
+  private resumeWorkers() {
+    this.paused = false
+    this.followerWorkers.forEach((worker, index) => {
+      worker.postMessage({ type: 'resume' })
+      if (this.workerStatus[index]) {
+        this.assignTaskIfAvailable(index)
+      }
+    })
+  }
+
+  async addTasks(tasks: FollowTask[]) {
+    this.taskQueue.push(...tasks)
+    // Try to assign tasks to any ready workers
+    this.followerWorkers.forEach((_, index) => {
+      if (this.workerStatus[index]) {
+        this.assignTaskIfAvailable(index)
+      }
+    })
+  }
+
+  async shutdown() {
+    this.healthCheckWorker.terminate()
+    await Promise.all(this.followerWorkers.map(w => w.terminate()))
+  }
+}
+
+async function main() {
+  try {
+    if (!process.env.BLUESKY_USERNAME || !process.env.BLUESKY_PASSWORD) {
+      throw new Error('Missing BLUESKY_USERNAME or BLUESKY_PASSWORD in .env file')
+    }
+
+    const targetAccounts = process.env.TARGET_ACCOUNTS?.split(',').map(a => a.trim())
+    if (!targetAccounts?.length) {
+      throw new Error('Missing TARGET_ACCOUNTS in .env file')
+    }
+
+    // Create temporary agent for initial follower fetching
+    const agent = new BskyAgent({ service: 'https://bsky.social' })
+    await agent.login({
+      identifier: process.env.BLUESKY_USERNAME,
+      password: process.env.BLUESKY_PASSWORD
+    })
+
+    const workerPool = new WorkerPool()
+
+    for (const targetAccount of targetAccounts) {
+      console.log(`\n📍 Processing followers for ${targetAccount}...`)
+      let cursor = ''
+
+      while (true) {
+        try {
+          const response = await agent.getFollowers({
+            actor: targetAccount,
+            limit: 100,
+            cursor: cursor
+          })
+
+          const tasks: FollowTask[] = response.data.followers.map(f => ({
+            did: f.did,
+            handle: f.handle
+          }))
+
+          await workerPool.addTasks(tasks)
+          console.log(`Added ${tasks.length} follow tasks to queue`)
+
+          if (!response.data.cursor) {
+            break
+          }
+          cursor = response.data.cursor
+
+          // Small delay between fetching pages
+          await new Promise(resolve => setTimeout(resolve, 1000))
+        } catch (err) {
+          if (err instanceof Error && err.message.includes('Rate Limit')) {
+            console.log('Rate limit hit while fetching followers, waiting 2 minutes...')
+            await new Promise(resolve => setTimeout(resolve, 120000))
+            continue
+          }
+          throw err
+        }
+      }
+    }
+
+    // Keep the process running until Ctrl+C
+    console.log('\n🔄 Workers are processing the queue. Press Ctrl+C to stop...')
+    process.on('SIGINT', async () => {
+      console.log('\nShutting down workers...')
+      await workerPool.shutdown()
+      process.exit(0)
+    })
+  } catch (error) {
+    console.error('Fatal error:', error instanceof Error ? error.message : error)
+    process.exit(1)
+  }
+}
+
+main()

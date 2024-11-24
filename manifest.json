@@ -1,0 +1,22 @@
+{
+  "manifest_version": 2,
+  "name": "Bluesky Mass Follow",
+  "version": "1.0",
+  "description": "Follow multiple Bluesky accounts efficiently with rate limiting",
+  "permissions": [
+    "storage",
+    "https://bsky.social/*"
+  ],
+  "browser_action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon.png"
+  },
+  "icons": {
+    "48": "icon.png",
+    "96": "icon.png"
+  },
+  "background": {
+    "scripts": ["dist/background.bundle.js"],
+    "persistent": false
+  }
+}

@@ -1,0 +1,91 @@
+import { BskyAgent, AppBskyActorDefs } from '@atproto/api'
+
+interface FollowingEntry {
+  did: string
+  handle: string
+  displayName?: string
+}
+
+export class BlueskyClient {
+  private agent: BskyAgent
+  private logPrefix = '🔷'
+
+  constructor() {
+    this.agent = new BskyAgent({ service: 'https://bsky.social' })
+  }
+
+  async login(identifier: string, password: string): Promise<void> {
+    console.log(`${this.logPrefix} Logging in as ${identifier}...`)
+    await this.agent.login({ identifier, password })
+    console.log(`${this.logPrefix} Login successful`)
+  }
+
+  async getProfile(handle: string) {
+    console.log(`${this.logPrefix} Fetching profile for ${handle}...`)
+    const profile = await this.agent.getProfile({ actor: handle })
+    console.log(`${this.logPrefix} Profile found: @${profile.data.handle}`)
+    return profile.data
+  }
+
+  async getFollowing(handle: string): Promise<FollowingEntry[]> {
+    console.log(`${this.logPrefix} Fetching accounts that ${handle} is following...`)
+    const profile = await this.getProfile(handle)
+    
+    let following: FollowingEntry[] = []
+    let cursor: string | undefined = undefined
+    
+    do {
+      const response = await this.agent.getFollows({
+        actor: profile.did,
+        limit: 100,
+        cursor
+      })
+      
+      following = following.concat(response.data.follows)
+      cursor = response.data.cursor
+    } while (cursor)
+
+    console.log(`${this.logPrefix} Found ${following.length} accounts that ${handle} is following`)
+    return following
+  }
+
+  async followUser(handle: string): Promise<boolean> {
+    try {
+      console.log(`${this.logPrefix} Attempting to follow ${handle}...`)
+      const profile = await this.getProfile(handle)
+      await this.agent.follow(profile.did)
+      console.log(`${this.logPrefix} Successfully followed ${handle}`)
+      return true
+    } catch (error) {
+      console.error(`${this.logPrefix} Failed to follow ${handle}:`, error instanceof Error ? error.message : error)
+      return false
+    }
+  }
+
+  async followUsersFollowing(targetHandles: string[]): Promise<void> {
+    console.log(`\n${this.logPrefix} Starting to process ${targetHandles.length} target accounts...\n`)
+    let totalFollowed = 0
+    let totalAttempted = 0
+
+    for (const targetHandle of targetHandles) {
+      try {
+        console.log(`\n${this.logPrefix} Processing target account: ${targetHandle}`)
+        const following = await this.getFollowing(targetHandle)
+        
+        for (const account of following) {
+          totalAttempted++
+          const success = await this.followUser(account.handle)
+          if (success) totalFollowed++
+          
+          // Add delay between follows to avoid rate limits
+          await new Promise(resolve => setTimeout(resolve, 2000))
+        }
+      } catch (error) {
+        console.error(`${this.logPrefix} Error processing ${targetHandle}:`, error instanceof Error ? error.message : error)
+      }
+    }
+
+    console.log(`\n${this.logPrefix} Follow process completed:`)
+    console.log(`   • Successfully followed: ${totalFollowed}/${totalAttempted}`)
+  }
+}
