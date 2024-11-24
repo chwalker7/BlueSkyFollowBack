@@ -1,3 +1,4 @@
+![image](https://github.com/user-attachments/assets/7cc32cb9-26ac-4f93-930b-53063ab8d143)
 # Bluesky Auto-Follow Back
 
 A Node.js application that automatically follows back users who follow you on Bluesky.
